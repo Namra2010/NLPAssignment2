@@ -172,7 +172,7 @@ def main():
         raise KeyError(f"Cannot find question field in example keys={list(ex.keys())}")
 
     def get_ground_truth(ex: Dict[str, Any]) -> Any:
-        for k in ["answer", "ground_truth", "target"]:
+        for k in ["answer", "ground_truth", "target", "solution"]:
             if k in ex:
                 return ex[k]
         raise KeyError(f"Cannot find answer field in example keys={list(ex.keys())}")
