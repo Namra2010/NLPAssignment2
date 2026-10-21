@@ -149,7 +149,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="data/models/Qwen2.5-Math-1.5B")
     ap.add_argument("--data", default="data/MATH/validation.jsonl")
-    ap.add_argument("--prompt_file", default="cs336_alignment/prompts/r1_zero.prompt")
+    ap.add_argument("--prompt_file", default="alignment/prompts/r1_zero.prompt")
     ap.add_argument("--out_dir", default="runs/math_baseline")
     ap.add_argument("--max_tokens", type=int, default=1024)
     ap.add_argument("--temperature", type=float, default=1.0)
