@@ -1,12 +1,17 @@
 import argparse
 import json
 import os
+import sys
+import pathlib
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional
 
 from vllm import LLM, SamplingParams
+
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
+
 from alignment.drgrpo_grader import r1_zero_reward_fn
 
 

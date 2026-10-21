@@ -7,13 +7,15 @@ import torch
 import random
 import vllm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
+
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
+
 from alignment.drgrpo_grader import r1_zero_reward_fn
 from alignment.sft_helper import (init_vllm, gradient_clip, 
     tokenize_prompt_and_output, get_response_log_probs,
     sft_microbatch_train_step, load_policy_into_vllm_instance,
     get_logger, save_checkpoints)
 
-sys.path.append(str(pathlib.Path(__file__).parent.parent))
 
 def get_dataset(fpath: os.PathLike) -> list:
     with open(fpath, 'r', encoding='utf8') as f:
