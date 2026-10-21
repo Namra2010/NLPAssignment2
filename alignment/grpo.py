@@ -1,372 +1,315 @@
-import torch
-import argparse
-import random
-import json
-import os
-import pathlib
-import sys
 from typing import Callable, Literal
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from vllm import LLM, SamplingParams
-from alignment.drgrpo_grader import r1_zero_reward_fn
-
-from alignment.sft_helper import (
-    init_vllm, tokenize_prompt_and_output, 
-    get_response_log_probs, get_logger,
-    gradient_clip, load_policy_into_vllm_instance)
-
-from alignment.sft_experiment import sft_eval
-
-sys.path.append(str(pathlib.Path(__file__).parent.parent))
+import torch
 
 
 def compute_group_normalized_rewards(
-    reward_fn: Callable,
+    reward_fn: Callable[[str, str], dict[str, float]],
     rollout_responses: list[str],
     repeated_ground_truths: list[str],
     group_size: int,
     advantage_eps: float,
     normalize_by_std: bool,
-    device: str = 'cpu'
-) -> tuple[torch.Tensor, dict[str, float]]:
-    
-    rewards = [reward_fn(rollout, gt)['answer_reward'] for rollout, gt in zip(rollout_responses, repeated_ground_truths)]
-    rewards = torch.tensor(rewards, device=device).reshape(-1, group_size)
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """
+    Returns:
+        normalized_rewards: (B,)
+        raw_rewards: (B,)
+        metadata: dict
+    """
+    if len(rollout_responses) != len(repeated_ground_truths):
+        raise ValueError("rollout_responses and repeated_ground_truths must have same length")
 
-    advantage = rewards - rewards.mean(dim=-1, keepdim=True)
-    if normalize_by_std is True:
-        advantage = advantage / (rewards.std(dim=-1, keepdim=True) + advantage_eps)
+    B = len(rollout_responses)
+    if B % group_size != 0:
+        raise ValueError(f"rollout_batch_size={B} must be divisible by group_size={group_size}")
+
+    # 1) raw rewards
+    raw = []
+    fmt = []
+    ans = []
+    for resp, gt in zip(rollout_responses, repeated_ground_truths):
+        out = reward_fn(resp, gt)
+        r = float(out["reward"])
+        raw.append(r)
+        fmt.append(float(out.get("format_reward", r)))
+        ans.append(float(out.get("answer_reward", r)))
+
+    raw_rewards = torch.tensor(raw, dtype=torch.float32)  # (B,)
+
+    # 2) group normalization
+    n_groups = B // group_size
+    grouped = raw_rewards.view(n_groups, group_size)  # (G, group_size)
+    mean = grouped.mean(dim=1, keepdim=True)          # (G, 1)
+    centered = grouped - mean                         # (G, group_size)
+
+    if normalize_by_std:
+        std = grouped.std(dim=1, keepdim=True)  # populaiton std
+        normalized = centered / (std + advantage_eps)
+    else:
+        normalized = centered
     
-    metadata = {}
-    return advantage.flatten(), rewards.flatten(), metadata
-    
+    normalized_rewards = normalized.reshape(-1)  # (B,)
+
+    metadata = {
+        "raw_reward_mean": float(raw_rewards.mean().item()),
+        "raw_reward_std": float(raw_rewards.std().item()),
+        "raw_reward_min": float(raw_rewards.min().item()),
+        "raw_reward_max": float(raw_rewards.max().item()),
+        "format_reward_mean": float(torch.tensor(fmt).mean().item()),
+        "answer_reward_mean": float(torch.tensor(ans).mean().item()),
+    }
+    return normalized_rewards, raw_rewards, metadata
+
 
 def compute_naive_policy_gradient_loss(
-    raw_rewards_or_advantages: torch.Tensor, 
-    policy_log_probs: torch.Tensor
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
 ) -> torch.Tensor:
-    
-    return -raw_rewards_or_advantages * policy_log_probs
+    """
+    Args:
+        raw_rewards_or_advantages: (batch_size, 1)
+        policy_log_probs: (batch_size, seq_len)
+
+    Returns:
+        per-token loss: (batch_size, seq_len)
+    """
+    assert raw_rewards_or_advantages.ndim == 2 and raw_rewards_or_advantages.shape[1] == 1, \
+        f"expected raw_rewards_or_advantages shape (B,1), got {tuple(raw_rewards_or_advantages.shape)}"
+    assert policy_log_probs.ndim == 2, \
+        f"expected policy_log_probs shape (B,T), got {tuple(policy_log_probs.shape)}"
+    assert raw_rewards_or_advantages.shape[0] == policy_log_probs.shape[0], \
+        "batch size mismatch"
+
+    # broadcast (B,1) -> (B,T)
+    advantages = raw_rewards_or_advantages.to(dtype=policy_log_probs.dtype, device=policy_log_probs.device)
+    return -advantages * policy_log_probs
+
+
+def compute_grpo_no_clip_loss(
+    advantages: torch.Tensor,          # (B, 1)
+    policy_log_probs: torch.Tensor,    # (B, T)
+    old_log_probs: torch.Tensor,       # (B, T)
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    assert advantages.ndim == 2 and advantages.shape[1] == 1, \
+        f"expected advantages (B,1), got {tuple(advantages.shape)}"
+    assert policy_log_probs.ndim == 2, \
+        f"expected policy_log_probs (B,T), got {tuple(policy_log_probs.shape)}"
+    assert policy_log_probs.shape == old_log_probs.shape, \
+        "policy_log_probs and old_log_probs must have same shape"
+    assert advantages.shape[0] == policy_log_probs.shape[0], \
+        "batch size mismatch"
+
+    adv = advantages.to(dtype=policy_log_probs.dtype, device=policy_log_probs.device)
+    log_ratio = policy_log_probs - old_log_probs
+    ratio = torch.exp(log_ratio)
+
+    # Unclipped surrogate: - ratio * A
+    loss = -(ratio * adv)
+
+    metadata = {
+        "ratio": ratio.detach(),
+        "log_ratio": log_ratio.detach(),
+        "ratio_mean": ratio.detach().mean(),
+        "ratio_max": ratio.detach().max(),
+        "ratio_min": ratio.detach().min(),
+        "approx_kl": (-(log_ratio)).detach().mean(),
+    }
+    return loss, metadata
 
 
 def compute_grpo_clip_loss(
-    advantages: torch.Tensor, 
-    policy_log_probs: torch.Tensor, 
-    old_log_probs: torch.Tensor, 
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
     cliprange: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    
-    important_weight = (policy_log_probs - old_log_probs).exp()
-    clipped_important_weight = torch.clip(important_weight, 1 - cliprange, 1 + cliprange)
+    """
+    Args:
+        advantages: (B, 1)
+        policy_log_probs: (B, T)
+        old_log_probs: (B, T)
+        cliprange: epsilon
 
-    grpo_clip_loss = torch.minimum(important_weight * advantages, clipped_important_weight * advantages)
+    Returns:
+        loss: (B, T)  per-token GRPO-Clip loss
+        metadata: dict[str, torch.Tensor]
+    """
+    assert advantages.ndim == 2 and advantages.shape[1] == 1, \
+        f"expected advantages shape (B,1), got {tuple(advantages.shape)}"
+    assert policy_log_probs.shape == old_log_probs.shape, \
+        "policy_log_probs and old_log_probs must have the same shape"
+    assert policy_log_probs.ndim == 2, \
+        f"expected log_probs shape (B,T), got {tuple(policy_log_probs.shape)}"
+    assert advantages.shape[0] == policy_log_probs.shape[0], \
+        "batch size mismatch"
     
-    metadata = {}
+    # broadcast (B, 1) -> (B, T)
+    adv = advantages.to(dtype=policy_log_probs.dtype, device=policy_log_probs.device)
 
-    return -grpo_clip_loss, metadata
+    # ratio = pi_theta / pi_old = exp(logpi - logpi_old)
+    log_ratio = policy_log_probs - old_log_probs
+    ratio = torch.exp(log_ratio)
+
+    # unclipped and clipped objectives
+    pg_unclipped = ratio * adv
+    ratio_clipped = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    pg_clipped = ratio_clipped * adv
+
+    # GRPO-Clip loss: -min(unclipped, clipped)
+    min_obj = torch.minimum(pg_unclipped, pg_clipped)
+    loss = -min_obj
+
+    # metadata
+    clipped_mask = (pg_clipped < pg_unclipped)
+
+    metadata = {
+        "ratio": ratio.detach(),
+        "ratio_clipped": ratio_clipped.detach(),
+        "clipped_mask": clipped_mask.detach(),
+        "clipfrac": clipped_mask.float().mean().detach(),
+    }
+    return loss, metadata
 
 
 def compute_policy_gradient_loss(
-    policy_log_probs: torch.Tensor, 
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"], 
-    raw_rewards: torch.Tensor | None = None, 
-    advantages: torch.Tensor | None = None, 
-    old_log_probs: torch.Tensor | None = None, 
-    cliprange: float | None = None, 
+    policy_log_probs: torch.Tensor,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    if loss_type == 'no_baseline':
-        metadata = {}
-        return compute_naive_policy_gradient_loss(
+    assert policy_log_probs.ndim == 2, \
+        f"expected policy_log_probs shape (B,T), got {tuple(policy_log_probs.shape)}"
+
+    metadata: dict[str, torch.Tensor] = {}
+
+    if loss_type == "no_baseline":
+        assert raw_rewards is not None, "raw_rewards is required for loss_type='no_baseline'"
+        loss = compute_naive_policy_gradient_loss(
             raw_rewards_or_advantages=raw_rewards,
-            policy_log_probs=policy_log_probs
-        ), metadata
-    elif loss_type == 'reinforce_with_baseline':
-        metadata = {}
-        return compute_naive_policy_gradient_loss(
+            policy_log_probs=policy_log_probs,
+        )
+        metadata["loss_type"] = torch.tensor(0)
+
+    elif loss_type == "reinforce_with_baseline":
+        assert advantages is not None, "advantages is required for loss_type='reinforce_with_baseline'"
+        loss = compute_naive_policy_gradient_loss(
             raw_rewards_or_advantages=advantages,
-            policy_log_probs=policy_log_probs
-        ), metadata
-    elif loss_type == 'grpo_clip':
-        return compute_grpo_clip_loss(
+            policy_log_probs=policy_log_probs,
+        )
+        metadata["loss_type"] = torch.tensor(1)
+
+    elif loss_type == "grpo_clip":
+        assert advantages is not None, "advantages is required for loss_type='grpo_clip'"
+        assert old_log_probs is not None, "old_log_probs is required for loss_type='grpo_clip'"
+        assert cliprange is not None, "cliprange is required for loss_type='grpo_clip'"
+        loss, submeta = compute_grpo_clip_loss(
             advantages=advantages,
             policy_log_probs=policy_log_probs,
             old_log_probs=old_log_probs,
-            cliprange=cliprange
+            cliprange=float(cliprange),
         )
+        metadata.update(submeta)
+        metadata["loss_type"] = torch.tensor(2)
+
+    elif loss_type == "grpo_no_clip":
+        assert advantages is not None
+        assert old_log_probs is not None
+        loss, submeta = compute_grpo_no_clip_loss(
+            advantages=advantages,
+            policy_log_probs=policy_log_probs,
+            old_log_probs=old_log_probs,
+        )
+        metadata.update(submeta) 
+
     else:
-        raise ValueError('loss_type is invalid!')
-    
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    return loss, metadata            
+
 
 def masked_mean(
-    tensor: torch.Tensor, 
-    mask: torch.Tensor, 
-    dim: int | None = None, 
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
 ) -> torch.Tensor:
-    masked = torch.where(mask==1, tensor, 0)
-    return masked.sum(dim=dim) / mask.sum(dim=dim)
+    """
+    Mean over elements where mask == 1.
+
+    Args:
+        tensor: any shape
+        mask: same shape as tensor, 0/1 or bool
+        dim: dimension to reduce; if None, reduce over all masked elements
+
+    Returns:
+        masked mean with the same semantics as tensor.mean(dim=dim)
+    """
+    assert tensor.shape == mask.shape, (
+        f"tensor and mask must have the same shape, got {tuple(tensor.shape)} vs {tuple(mask.shape)}"
+    )
+
+    # Convert mask to some dtype/device for arithmetic
+    m = mask.to(dtype=tensor.dtype, device=tensor.device)
+
+    num = (tensor * m).sum(dim=dim)
+    denom = m.sum(dim=dim)
+
+    return num / denom
 
 
 def grpo_microbatch_train_step(
-    policy_log_probs: torch.Tensor, 
-    response_mask: torch.Tensor, 
-    gradient_accumulation_steps: int, 
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"], 
-    raw_rewards: torch.Tensor | None = None, 
-    advantages: torch.Tensor | None = None, 
-    old_log_probs: torch.Tensor | None = None, 
-    cliprange: float | None = None, 
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    policy_gradient_loss, metadata = compute_policy_gradient_loss(
+    """
+    Performs forward+backward for one microbatch.
+
+    Returns:
+        loss: scalar tensor (already scaled by grad_acc_steps) for logging
+        metadata: dict[str, torch.Tensor]
+    """
+    assert policy_log_probs.ndim == 2, f"policy_log_probs must be (B,T), got {tuple(policy_log_probs.shape)}"
+    assert response_mask.shape == policy_log_probs.shape, (
+        f"response_mask must match policy_log_probs shape, got {tuple(response_mask.shape)}"
+    )
+    assert isinstance(gradient_accumulation_steps, int) and gradient_accumulation_steps >= 1, \
+        "gradient_accumulation_steps must be >= 1"
+    
+    # 1) per-token PG loss (B,T) + metadata
+    token_loss, meta = compute_policy_gradient_loss(
         policy_log_probs=policy_log_probs,
         loss_type=loss_type,
         raw_rewards=raw_rewards,
         advantages=advantages,
         old_log_probs=old_log_probs,
-        cliprange=cliprange
+        cliprange=cliprange,
     )
 
-    masked_loss = masked_mean(
-        tensor=policy_gradient_loss,
+    # 2) per-sample loss: masked mean over sequence dim -> (B,)
+    per_sample_loss = masked_mean(
+        tensor=token_loss,
         mask=response_mask,
-        dim=-1
+        dim=1,
     )
 
-    loss = masked_loss.mean() / gradient_accumulation_steps
+    # 3) batch mean -> scalar
+    batch_loss = per_sample_loss.mean()
 
-    loss.backward()
-    return loss, metadata
+    # 4) scale for gradient accumulation
+    scaled_loss = batch_loss / float(gradient_accumulation_steps)
 
+    # 5) backward
+    scaled_loss.backward()
 
-def get_dataset(fpath: os.PathLike) -> list:
-    with open(fpath, 'r', encoding='utf8') as f:
-        dataset = [json.loads(x.strip()) for x in f]
-    return dataset
-
-
-def get_template(fpath: os.PathLike) -> str:
-    with open(fpath, 'r', encoding='utf8') as f:
-        template = f.read()
-    return template
-
-def set_random_seed(seed: int = 42):
-    torch.manual_seed(seed)
-    random.seed(seed)
-
-
-def train_grpo(args):
-    set_random_seed(args.seed)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    logger = get_logger(log_path=os.path.join(args.output_dir, 'main.log'))
-
-    # Assert check.
-    assert args.train_batch_size % args.gradient_accumulation_steps == 0, (
-        "train_batch_size must be divisible by gradient_accumulation_steps" 
-    ) 
-    micro_train_batch_size = args.train_batch_size // args.gradient_accumulation_steps 
-
-    assert args.rollout_batch_size % args.group_size == 0, (
-        "rollout_batch_size must be divisible by group_size" 
-    ) 
-    n_prompts_per_rollout_batch = args.rollout_batch_size // args.group_size 
-
-    assert args.train_batch_size >= args.group_size, (
-        "train_batch_size must be greater than or equal to group_size" 
-    ) 
-    # n_microbatches_per_rollout_batch = args.rollout_batch_size // micro_train_batch_size
-
-
-    # Constuct model, tokenizer and optimizer.
-    model = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=args.model_path,
-        torch_dtype = torch.bfloat16,
-        attn_implementation = 'flash_attention_2',
-        # attn_implementation = 'eager'
-    ).to(device=args.device_train)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    optimizer = torch.optim.AdamW(
-        params=model.parameters(),
-        lr=args.learning_rate,
-        betas=args.betas,
-        weight_decay=args.weight_decay
-    )
-    vllm_model = init_vllm(
-        model_id=args.model_path,
-        device=args.device_eval,
-        seed=args.seed,
-        gpu_memory_utilization=args.gpu_memory_utilization
-    )
-
-    sampling_params = SamplingParams(
-        n=args.group_size, 
-        temperature=args.sampling_temperature, 
-        top_p=1.0, 
-        seed=args.seed,
-        stop=["</answer>"], 
-        include_stop_str_in_output=True, 
-        min_tokens=args.sampling_min_tokens, 
-        max_tokens=args.sampling_max_tokens, 
-    )
-
-
-    # Compile model.
-    if torch.cuda.is_available() and 'cuda' in args.device_train:
-        torch.set_float32_matmul_precision('high')
-        torch.compile(model)
-
-
-    prompt_template = get_template(args.template_path)
-    train_dataset = get_dataset(args.train_dataset_path)
-
-
-    for grpo_step in range(args.n_grpo_steps):
-        rollout_sammple_data = random.sample(train_dataset, k=n_prompts_per_rollout_batch)
-
-        rollout_prompts = [prompt_template.format(question=x['problem']) for x in rollout_sammple_data]
-        rollout_answers = [x["answer"] for x in rollout_sammple_data]
-
-        outputs = vllm_model.generate(rollout_prompts, sampling_params)
-                           
-        repeated_answers = []
-        generations = []
-        prompts = []
-        for output, answer in zip(outputs, rollout_answers):
-            for i in range(args.group_size):
-                generated_text = output.outputs[i].text
-                prompts.append(output.prompt)
-                generations.append(generated_text)
-                repeated_answers.append(answer)
-
-        advantages, raw_rewards, metadata = compute_group_normalized_rewards(
-            reward_fn=r1_zero_reward_fn, 
-            rollout_responses=generations, 
-            repeated_ground_truths=repeated_answers, 
-            group_size=args.group_size, 
-            advantage_eps=args.advantage_eps, 
-            normalize_by_std=args.use_std_normalization, 
-            device=args.device_train
-        )
-
-        tokenizations = tokenize_prompt_and_output(prompts, generations, tokenizer, args.device_train)
-        
-        n_train_steps_per_epoch = args.rollout_batch_size // args.train_batch_size
-        loop_shape = (n_train_steps_per_epoch, args.gradient_accumulation_steps, micro_train_batch_size)
-        
-        input_ids = tokenizations["input_ids"].reshape(*loop_shape, -1)
-        labels = tokenizations["labels"].reshape(*loop_shape, -1)
-        response_mask = tokenizations["response_mask"].reshape(*loop_shape, -1)
-
-
-        with torch.no_grad():
-            old_log_probs = []
-            for train_step in range(n_train_steps_per_epoch):
-                for micro_step in range(args.gradient_accumulation_steps):
-                    micro_input_ids = input_ids[train_step][micro_step]
-                    micro_labels = labels[train_step][micro_step]
-
-                    # Compute old log_probs.
-                    log_probs_dict = get_response_log_probs(model, micro_input_ids, micro_labels, return_token_entropy=True)
-                    log_probs, token_entropy = log_probs_dict["log_probs"], log_probs_dict["token_entropy"]
-                    old_log_probs.append(log_probs)
-            old_log_probs = torch.cat(old_log_probs)
-            old_log_probs = old_log_probs.reshape(*loop_shape, -1)
-
-        advantages = advantages.reshape(*loop_shape, -1)
-        raw_rewards = raw_rewards.reshape(*loop_shape, -1)
-
-        for reply_epoch in range(args.epochs_per_rollout_batch):
-            for train_step in range(n_train_steps_per_epoch):
-                for micro_step in range(args.gradient_accumulation_steps):
-                    micro_advantages = advantages[train_step][micro_step]
-                    micro_raw_rewards = raw_rewards[train_step][micro_step]
-                    micro_old_log_probs = old_log_probs[train_step][micro_step]
-                    micro_input_ids = input_ids[train_step][micro_step]
-                    micro_labels = labels[train_step][micro_step]
-                    micro_response_mask = response_mask[train_step][micro_step]
-
-                    # Compute new log_probs.
-                    log_probs_dict = get_response_log_probs(model, micro_input_ids, micro_labels, return_token_entropy=True)
-                    policy_log_probs, token_entropy = log_probs_dict["log_probs"], log_probs_dict["token_entropy"]
-                    
-                    loss, metadata = grpo_microbatch_train_step(
-                        policy_log_probs=policy_log_probs,
-                        response_mask=micro_response_mask,
-                        gradient_accumulation_steps=args.gradient_accumulation_steps,
-                        loss_type=args.loss_type,
-                        raw_rewards=micro_raw_rewards,
-                        advantages=micro_advantages,
-                        old_log_probs=micro_old_log_probs,
-                        cliprange=args.cliprange
-                    )
-
-                    logger.info(f'TRAIN | grpo_step: {grpo_step}, reply_epoch: {reply_epoch}, train_step: {train_step}, micro_step: {micro_step}, loss = {loss:.4f}')
-                
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-
-        load_policy_into_vllm_instance(model, vllm_model)  
-        if grpo_step != 0 and grpo_step % args.grpo_eval_freq == 0:
-            format_acc, answer_acc = sft_eval(
-                llm=vllm_model, 
-                eval_data_path=args.val_dataset_path, 
-                num_eval=args.num_eval, 
-                tempalte_path=args.template_path,
-                seed=args.seed
-            )
-            logger.info(f"VAL | grpo_step: {grpo_step}, reply_epoch: {reply_epoch}, train_step: {train_step}, format_acc = {format_acc:.4f}, answer_acc = {answer_acc:.4f}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    # Load file path.
-    parser.add_argument('--model_path', type=str,  default='models/Qwen2.5-Math-1.5B')
-    parser.add_argument('--template_path', default='cs336_alignment/prompts/r1_zero.prompt')
-    parser.add_argument('--train_dataset_path', type=str,  default='data/MATH/train.jsonl')
-    parser.add_argument('--val_dataset_path', type=str,  default='data/MATH/validation.jsonl')
-
-    # Device setting.
-    parser.add_argument('--seed', default=42)
-    parser.add_argument('--device_train', default='cuda:1')
-    parser.add_argument('--device_eval', default='cuda:0')
-
-    # Smapler and inference parameter.
-    parser.add_argument('--sampling_temperature', type=float,  default=1.0)
-    parser.add_argument('--sampling_min_tokens', type=int,  default=4)
-    parser.add_argument('--sampling_max_tokens', type=int,  default=1024)
-    parser.add_argument('--gpu_memory_utilization', type=float,  default=0.85)
-    parser.add_argument("--cliprange", type=float, default=0.2)
-
-    # Train loop.
-    parser.add_argument('--n_grpo_steps', type=int,  default=200)
-    parser.add_argument('--epochs_per_rollout_batch', type=int,  default=1)
-    parser.add_argument('--rollout_batch_size', type=int,  default=32)
-    parser.add_argument('--train_batch_size', type=int,  default=32)
-    parser.add_argument('--gradient_accumulation_steps', type=int,  default=32)
-    parser.add_argument('--group_size', type=int,  default=8)
-    parser.add_argument('--grpo_eval_freq', default=20)
-    parser.add_argument('--num_eval', default=5000)
-
-    # Optimizer.
-    parser.add_argument('--learning_rate', type=float,  default=1e-5)
-    parser.add_argument('--weight_decay', type=float,  default=0.0)
-    parser.add_argument('--betas', type=tuple,  default=(0.9, 0.95))
-
-    # Log and checkpoints.
-    parser.add_argument('--output_dir', default='exp_output/grpo')
-
-    # Policy gradient parameter.
-    parser.add_argument('--advantage_eps', type=float,  default=1e-6)
-    parser.add_argument('--use_std_normalization', type=bool,  default=True)
-    parser.add_argument(
-        '--loss_type', 
-        type=str, 
-        default='reinforce_with_baseline', 
-        choices=['no_baseline', 'reinforce_with_baseline', 'grpo_clip']
-    )
-    args = parser.parse_args()
-    return args
-
-if __name__ == '__main__':
-    cfg = parse_args()
-    train_grpo(cfg)
+    # metadata
+    meta = dict(meta)
+    meta["batch_loss_unscaled"] = batch_loss.detach()
+    meta["batch_loss_scaled"] = scaled_loss.detach()
+    return scaled_loss.detach(), meta    
