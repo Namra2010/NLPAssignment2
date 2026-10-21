@@ -1,6 +1,3 @@
-from alignment.utils import evaluate_vllm
-from alignment.drgrpo_grader import r1_zero_reward_fn
-
 import vllm
 import argparse
 import json
@@ -11,6 +8,8 @@ import torch
 
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 
+from alignment.utils import evaluate_vllm
+from alignment.drgrpo_grader import r1_zero_reward_fn
 
 def main(
     model_path: os.PathLike, 
@@ -29,7 +28,7 @@ def main(
 
     # Extract the problems and answers.
     prompts = [prompt_template.format(question = x['problem']) for x in valid_data]
-    answers = [x['answer'] for x in valid_data]
+    answers = [x['solution'] for x in valid_data]
 
     # Evaluate the LLM model based on the reward function.
     evaluate_vllm(
@@ -42,7 +41,7 @@ def main(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model-path', default='models/Qwen2.5-Math-1.5B')
+    parser.add_argument('--model-path', default='data/models/Qwen2.5-Math-1.5B')
     parser.add_argument('--valid-path', default='data/MATH/validation.jsonl')
     parser.add_argument('--prompt-template-path', default='alignment/prompts/r1_zero.prompt')
     args = parser.parse_args()
