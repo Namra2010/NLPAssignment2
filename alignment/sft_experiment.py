@@ -1,216 +1,406 @@
-import os
-import json
-import sys
 import argparse
+import json
+import time
+import sys
 import pathlib
-import torch
+from typing import Dict, Any
+import os
 import random
-import vllm
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
+from pathlib import Path
+from datetime import datetime
+
+import torch
+import wandb
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from unittest.mock import patch
+from vllm import LLM, SamplingParams
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 
+from alignment.math_baseline import evaluate_vllm
+from alignment.sft_helper import tokenize_prompt_and_output, get_response_log_probs, sft_microbatch_train_step, log_generations
 from alignment.drgrpo_grader import r1_zero_reward_fn
-from alignment.sft_helper import (init_vllm, gradient_clip, 
-    tokenize_prompt_and_output, get_response_log_probs,
-    sft_microbatch_train_step, load_policy_into_vllm_instance,
-    get_logger, save_checkpoints)
 
 
-def get_dataset(fpath: os.PathLike) -> list:
-    with open(fpath, 'r', encoding='utf8') as f:
-        dataset = [json.loads(x.strip()) for x in f]
-    return dataset
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.4):
+    vllm_set_random_seed(seed)
+    world_size_path = patch("torch.distributed.get_world_size", return_value=1)
+    profiling_patch = patch(
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        return_value=None
+    )
+    with world_size_path, profiling_patch:
+        return LLM(
+            model=model_id,
+            device=device,
+            dtype=torch.bfloat16,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
 
 
-def get_random_batch_data(train_dataset: list, batch_size: int):
-    # sample_index = np.random.choice(np.arange(len(train_dataset)), size=(batch_size))
-    # sampled_data = [train_dataset[idx] for idx in sample_index.tolist()]
-    sampled_data = random.sample(population=train_dataset, k=batch_size)
-    prompt = [x['prompt'] for x in sampled_data]
-    response = [x['response'] for x in sampled_data]
-    ground_truth = [x['ground_truth'] for x in sampled_data]
-    return prompt, response, ground_truth
+def load_policy_into_vllm_instance(policy, llm: LLM):
+    state_dict = policy.state_dict()
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(state_dict.items())
 
 
-def get_seqence_batch_data(train_dataset: list, batch_size: int, start_idx: int):
-    assert batch_size + start_idx < len(train_dataset)
-    sampled_data = train_dataset[start_idx: start_idx + batch_size]
-    prompt = [x['prompt'] for x in sampled_data]
-    response = [x['response'] for x in sampled_data]
-    ground_truth = [x['ground_truth'] for x in sampled_data]
-    return prompt, response, ground_truth
+class SFTDataset(Dataset):
+    def __init__(self, path: str, limit: int = 0, seed: int = 0):
+        self.data = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                self.data.append(json.loads(line))
+        if limit and limit > 0:
+            rnd = random.Random(seed)
+            rnd.shuffle(self.data)
+            self.data = self.data[:limit]
 
+    def __len__(self):
+        return len(self.data)
 
-def sft_eval(llm: vllm.LLM, eval_dataset: list[dict], tempalte_path: os.PathLike, seed: int = 42):
+    def __getitem__(self, idx):
+        ex = self.data[idx]
+        return ex["prompt"], ex["response"], ex
     
-    with open(tempalte_path, 'r', encoding='utf8') as f:
-        template = f.read()
-    
-    questions = [template.format(question=x['problem']) for x in eval_dataset]
-    answers = [x['answer'] for x in eval_dataset]
 
-    sampling_params = vllm.SamplingParams(
-        n=1,
-        temperature=1.0, 
-        top_p=1.0, 
-        seed=seed,
-        stop=['</answer>'],
+def collate_fn(batch, tokenizer):
+    prompts = [x[0] for x in batch]
+    outputs = [x[1] for x in batch]
+
+    toks = tokenize_prompt_and_output(prompts, outputs, tokenizer)
+    return toks
+
+
+def build_math_val_prompts_and_gts(val_path: str, prompt_file: str, max_examples: int = 0):
+    prompt_template = Path(prompt_file).read_text(encoding="utf-8")
+
+    val = []
+    with open(val_path, "r", encoding="utf-8") as f:
+        for line in f:
+            val.append(json.loads(line))
+
+    if max_examples and max_examples > 0:
+        val = val[:max_examples]
+
+    prompts, gts = [], []
+    for ex in val:
+        q = ex.get("problem") or ex.get("question") or ex.get("prompt")
+        gt = ex.get("solution") or ex.get("ground_truth") or ex.get("target")
+        if q is None or gt is None:
+            raise KeyError(f"Validation example missing question/solution fields: keys={list(ex.keys())}")
+        prompts.append(prompt_template.format(question=q))
+        gts.append(gt)
+
+    return prompts, gts
+
+
+def filter_correct_sft_samples(data_path: str, out_path: str):
+    """
+    Filtering: Only retain SFT samples that can produce the correct answer.
+    """
+    kept = []
+    total = 0
+    with open(data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            ex = json.loads(line)
+            total += 1
+            gt = ex.get("solution") or ex.get("ground_truth")
+            if gt is None:
+                raise RuntimeError(
+                    "sft.jsonl does not contain ground-truth fields (answer/ground_truth). "
+                )
+            resp = ex["response"]
+            scores = r1_zero_reward_fn(resp, gt)
+            if float(scores.get("answer_reward", 0.0)) >= 1.0:
+                kept.append(ex)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as w:
+        for ex in kept:
+            w.write(json.dumps(ex, ensure_ascii=False) + "\n")
+    
+    return {"filtered/kept": len(kept), "filtered/total": total}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_id", default="data/models/Qwen2.5-Math-1.5B")
+    ap.add_argument("--sft_path", default="data/sft.jsonl")
+    ap.add_argument("--val_path", default="data/MATH/validation.jsonl")
+    ap.add_argument("--prompt_file", default="alignment/prompts/r1_zero.prompt")
+
+    ap.add_argument("--train_device", default="cuda:0")
+    ap.add_argument("--vllm_device", default="cuda:0")
+
+    ap.add_argument("--train_samples", type=int, default=0, help="0 means full dataset")
+    ap.add_argument("--filter_correct", action="store_true")
+
+    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--micro_batch_size", type=int, default=1)
+    ap.add_argument("--grad_acc_steps", type=int, default=16)
+    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--max_steps", type=int, default=2000)
+    ap.add_argument("--eval_interval", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out_dir", default="runs/sft_experiment")
+    ap.add_argument("--eval_max_examples", type=int, default=500)
+    ap.add_argument("--wandb_project", default="nlp-assignment2-sft-filtered")
+    ap.add_argument("--wandb_entity", default=None)
+    ap.add_argument("--wandb_group", default="sft-sample-size-comparison")
+    ap.add_argument(
+        "--wandb_mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+        help="W&B logging mode",
+    )
+    args = ap.parse_args()
+
+    # logging
+    if (
+        args.epochs <= 0
+        or args.max_steps <= 0
+        or args.eval_interval <= 0
+        or args.micro_batch_size <= 0
+        or args.grad_acc_steps <= 0
+        or args.train_samples < 0
+    ):
+        ap.error(
+            "--epochs, --max_steps, --eval_interval, --micro_batch_size, and "
+            "--grad_acc_steps must be positive; --train_samples cannot be negative"
+        )
+
+    run_dir = Path(args.out_dir) / (
+        f"samples{args.train_samples or 'full'}_epochs{args.epochs}_"
+        f"{'filtered' if args.filter_correct else 'all'}"
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "log.jsonl"
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=run_dir.name,
+        group=args.wandb_group,
+        config=vars(args),
+        mode=args.wandb_mode,
+    )
+    if args.wandb_mode != "disabled":
+        wandb.define_metric("train_step")
+        wandb.define_metric("eval_epoch")
+        wandb.define_metric("train/*", step_metric="train_step")
+        wandb.define_metric("eval/*", step_metric="eval_epoch")
+
+    opt_step = 0  # counts optimizer updates
+    step = 0
+    micro_idx = 0
+
+    def log_event(event: Dict[str, Any], *, also_print: bool = True):
+        """
+        Append one json line to log.jsonl (and optionally print a readable message).
+        """
+        payload = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "time": time.time(),
+            "step": step,
+            "micro_idx": micro_idx,
+            "opt_step": opt_step,
+            **event,
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            f.flush()
+
+        if event.get("type") == "train_loss":
+            wandb_run.log(
+                {
+                    "train_step": step,
+                    "train/loss": event["loss"],
+                    "train/optimizer_step": opt_step,
+                }
+            )
+        elif event.get("type") == "eval_metrics":
+            wandb_run.log(
+                {
+                    "eval_epoch": event["epoch"],
+                    **event["metrics"],
+                }
+            )
+        elif event.get("type") == "filter_stats":
+            wandb_run.log(
+                {
+                    "data/filtered_kept": event["stats"]["filtered/kept"],
+                    "data/filtered_total": event["stats"]["filtered/total"],
+                }
+            )
+
+        if also_print:
+            # keep terminal readable
+            if "msg" in event:
+                print(event["msg"])
+            else:
+                print(payload)
+
+    # seed
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+
+    # tokenizer/model on train device
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    policy = AutoModelForCausalLM.from_pretrained(
+        args.model_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    ).to(args.train_device)
+    policy.gradient_checkpointing_enable()
+    policy.config.use_cache = False
+    policy.train()
+
+    # vLLM on eval device
+    llm = init_vllm(args.model_id, device=args.vllm_device, seed=args.seed)
+
+    eval_prompts, eval_gts = build_math_val_prompts_and_gts(
+        args.val_path, args.prompt_file, max_examples=args.eval_max_examples
+    )
+
+    eval_sampling_params = SamplingParams(
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=512,
+        stop=["</answer>"],
         include_stop_str_in_output=True,
-        min_tokens=4,
-        max_tokens=1024, 
     )
 
-    outputs = llm.generate(questions, sampling_params)
-    completes = []
-    eval_results = []
-    for output, answer in zip(outputs, answers):
-        complete = output.outputs[0].text
-        rewards = r1_zero_reward_fn(complete, answer)
-        completes.append(complete)
-        eval_results.append(rewards)
-    format_accuracy = sum([reward['format_reward'] for reward in eval_results]) / len(eval_dataset)
-    answer_accuracy = sum([reward['answer_reward'] for reward in eval_results]) / len(eval_dataset)
-
-    return format_accuracy, answer_accuracy
-
-
-def set_random_seed(seed: int = 42):
-    torch.manual_seed(seed)
-    random.seed(seed)
-
-
-def sft_train(args):
-    # logger setting
-    set_random_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
-    logger = get_logger(os.path.join(args.output_dir, 'main.log'))
-
-    # torch setting
-    if torch.cuda.is_available() and 'cuda' in args.device_train:
-        torch.set_float32_matmul_precision("high")
-
-    # model, tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=args.model_path,
-        torch_dtype = torch.bfloat16,
-        # attn_implementation = 'eager', # if don't use flash attention
-        attn_implementation = 'flash_attention_2'
-    ).to(device=args.device_train)
-    torch.compile(model)
-    llm = init_vllm(model_id=args.model_path, device=args.device_eval, seed=args.seed)
-    
-    # optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-
-    # train dataset
-    train_dataset = get_dataset(fpath = args.train_dataset_path)
-    if args.max_unique_sample != -1:
-        train_dataset = train_dataset[:args.max_unique_sample]
+    # optionally filter dataset
+    data_path = args.sft_path
     if args.filter_correct:
-        train_dataset = [sample for sample in train_dataset if r1_zero_reward_fn(sample["response"], sample["ground_truth"])["reward"] == 1]
+        filtered_path = str(Path(args.out_dir) / "filtered_sft.jsonl")
+        stats = filter_correct_sft_samples(args.sft_path, filtered_path)
+        log_event({"type": "filter_stats", "stats": stats, "msg": f"Filter stats: {stats}"})
+        data_path = filtered_path
 
-    # val dataset
-    validation_datset = get_dataset(fpath = args.eval_dataset_path)
-    if args.num_eval < len(validation_datset):
-        validation_datset = validation_datset[:args.num_eval]
-
-    format_acc, answer_acc = sft_eval(llm, eval_dataset=validation_datset, tempalte_path=args.template_path, seed=args.seed)
-    logger.info(f'Init VALIDATION | format_acc = {format_acc}, answer_acc = {answer_acc}')
-
-    batch_size = args.batch_size
-    micro_batch_size = args.batch_size // args.gradient_accumulation_steps
-
-    nums_step = args.base_epoch * len(train_dataset) // args.batch_size 
-    eval_step = nums_step // args.base_epoch
-
-    lr_scheduler = get_scheduler(
-        'cosine',
-        optimizer=optimizer,
-        # num_warmup_steps=int(0.03 * nums_step),
-        num_warmup_steps=0,
-        num_training_steps=nums_step
+    dataset = SFTDataset(data_path, limit=args.train_samples, seed=args.seed)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.micro_batch_size,
+        shuffle=True,
+        collate_fn=lambda b: collate_fn(b, tokenizer),
+        drop_last=True,
     )
+    if len(loader) == 0:
+        raise ValueError("The training dataset is empty after applying the sample limit.")
+    planned_steps = min(len(loader) * args.epochs, args.max_steps)
 
-    for step in range(1, nums_step + 1):
-        for microstep in range(args.gradient_accumulation_steps):
-            start_idx = step * batch_size + microstep * micro_batch_size
-            prompt, response, gt = get_random_batch_data(train_dataset, micro_batch_size)
-            # prompt, response, gt = get_seqence_batch_data(train_dataset, micro_batch_size, start_idx)
-            tokenizations = tokenize_prompt_and_output(prompt, response, tokenizer, device=args.device_train)
-            log_probs_dict = get_response_log_probs(model, tokenizations["input_ids"], tokenizations["labels"], return_token_entropy=True)
-            log_probs, token_entropy = log_probs_dict["log_probs"], log_probs_dict["token_entropy"]
-            loss, metadata = sft_microbatch_train_step(log_probs, tokenizations["response_mask"], args.gradient_accumulation_steps)
-            
-            logger.info(f'TRAIN | step: {step}, lr: {lr_scheduler.get_last_lr()[0]}, microstep: {microstep}, loss: {loss:.4f}')
-        
-        del tokenizations
-        torch.cuda.empty_cache()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-        lr_scheduler.step()
+    opt = torch.optim.AdamW(policy.parameters(), lr=args.lr)
 
-        # evaluatioe
-        if step % eval_step == 0:
-            load_policy_into_vllm_instance(model, llm)
-            format_acc, answer_acc = sft_eval(llm, eval_dataset=validation_datset, tempalte_path=args.template_path, seed=args.seed)
-            logger.info(f'VALIDATION | step: {step}, format_acc = {format_acc}, answer_acc = {answer_acc}')
+    # training loop
+    opt.zero_grad(set_to_none=True)
 
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-        handler.close()
+    for epoch in range(args.epochs):
+        for batch in loader:
+            step += 1
+            micro_idx += 1
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    # Dataset and
-    parser.add_argument('--model_path', default='models/Qwen2.5-Math-1.5B')
-    parser.add_argument('--train_dataset_path', default='data/MATH/sft.jsonl')
-    parser.add_argument('--eval_dataset_path', default='data/MATH/validation.jsonl')
-    parser.add_argument('--template_path', default='cs336_alignment/prompts/r1_zero.prompt')
-    parser.add_argument('--filter_correct', default=False)
-    parser.add_argument('--max_unique_sample', default=-1)
+            input_ids = batch["input_ids"].to(args.train_device)
+            labels = batch["labels"].to(args.train_device)
+            response_mask = batch["response_mask"].to(args.train_device)
 
-    # Device setting.
-    parser.add_argument('--seed', default=42)
-    parser.add_argument('--device_train', default='cuda:1')
-    parser.add_argument('--device_eval', default='cuda:0')
+            # get per-token log_probs (B, T)
+            out = get_response_log_probs(policy, input_ids, labels, return_token_entropy=False)
+            policy_log_probs = out["log_probs"]
 
-    # Optimizer.
-    parser.add_argument('--lr', default=5e-5)
+            # microbatch train step: does backward inside
+            loss, meta = sft_microbatch_train_step(
+                policy_log_probs=policy_log_probs,
+                response_mask=response_mask,
+                gradient_accumulation_steps=args.grad_acc_steps,
+                normalize_constant=1.0,
+            )
+            log_event(
+                {"type": "train_loss", "loss": float(meta["nll"])},
+                also_print=False,
+            )
 
-    # Log and checkpoints.
-    parser.add_argument('--output_dir', default='exp_output/sft')
+            # optimizer step each grad_acc_steps
+            if micro_idx % args.grad_acc_steps == 0 or step == planned_steps:
+                remainder = micro_idx % args.grad_acc_steps
+                if remainder:
+                    grad_scale = args.grad_acc_steps / remainder
+                    for parameter in policy.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(grad_scale)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                opt_step += 1
 
-    # Train loop.
-    parser.add_argument('--base_epoch', default=20)
-    parser.add_argument('--batch_size', default=64)
-    # parser.add_argument('--num_train_steps', default=-1)
-    parser.add_argument('--gradient_accumulation_steps', default=64) # BUG: when gradient-accumulation != num-train-steps
-    parser.add_argument('--eval_step', default=1)
-    parser.add_argument('--num_eval', default=5000)
-    
+            # periodic eval
+            epoch_end_step = min((epoch + 1) * len(loader), planned_steps)
+            if (
+                step % args.eval_interval == 0
+                or step == epoch_end_step
+                or step == planned_steps
+            ):
+                policy.eval()
+                with torch.no_grad():
+                    load_policy_into_vllm_instance(policy, llm)
+                    rows = evaluate_vllm(
+                        vllm_model=llm,
+                        reward_fn=r1_zero_reward_fn,
+                        prompts=eval_prompts,
+                        ground_truths=eval_gts,
+                        eval_sampling_params=eval_sampling_params,
+                        request_batch_size=64,
+                    )
 
-    args = parser.parse_args()
-    return args
+                # generation log records
+                # gen_log = log_generations(
+                #     model=policy,
+                #     tokenizer=tokenizer,
+                #     prompts=eval_prompts[:8],
+                #     ground_truths=eval_gts[:8],
+                #     reward_fn=r1_zero_reward_fn,
+                #     num_log=8,
+                #     step=step,
+                #     stop_str="</answer>",
+                #     max_new_tokens=512,
+                #     temperature=0.0,
+                # )
+
+                # log_event({"type": "gen_stats", "gen_stats": gen_log["stats"], "msg": f"gen stats: {gen_log['stats']}"})
+
+                n = len(rows)
+                eval_acc = sum(r.answer_reward for r in rows) / n if n else 0.0
+                eval_format = sum(r.format_reward for r in rows) / n if n else 0.0
+                eval_reward = sum(r.reward for r in rows) / n if n else 0.0
+                metrics = {
+                    "eval/accuracy": eval_acc,
+                    "eval/format_rate": eval_format,
+                    "eval/avg_reward": eval_reward,
+                    "eval/n": n,
+                }
+                log_event(
+                    {
+                        "type": "eval_metrics",
+                        "epoch": epoch + 1,
+                        "metrics": metrics,
+                        "msg": f"[epoch={epoch + 1}, step={step}] {metrics}",
+                    }
+                )
+                policy.train()
+
+            if step >= planned_steps:
+                break
+        if step >= planned_steps:
+            break
+
+    # save
+    policy.save_pretrained(str(run_dir))
+    tokenizer.save_pretrained(str(run_dir))
+    log_event({"type": "save", "out_dir": str(run_dir), "msg": f"Saved: {run_dir}"})
+    wandb_run.finish()
 
 
-if __name__ == '__main__':
-    args = parse_args()
-
-    configs = [
-        {'max_unique_sample': 128, 'filter_correct': False},
-        # {'max_unique_sample': 256, 'filter_correct': False},
-        # {'max_unique_sample': 512, 'filter_correct': False},
-        # {'max_unique_sample': 1024, 'filter_correct': False},
-        # {'max_unique_sample': -1, 'filter_correct': False},
-        # {'max_unique_sample': -1, 'filter_correct': True},
-    ]
-    
-    for config in configs:
-        args.filter_correct = config['filter_correct']
-        args.max_unique_sample = config['max_unique_sample']
-        num_sample = config['max_unique_sample'] if config['max_unique_sample'] != -1 else 'all'
-        args.output_dir = f"exp_output/sft_{num_sample}_filter_{config['filter_correct']}"
-        sft_train(args)
+if __name__ == "__main__":
+    main()
