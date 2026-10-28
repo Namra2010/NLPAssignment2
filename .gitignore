@@ -1,6 +1,8 @@
 *.bin
 models/
 data/
+runs/
+wandb/
 
 nav
 tags
